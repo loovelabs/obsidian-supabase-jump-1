@@ -1,6 +1,6 @@
 import { Notice, TFile, Vault, Platform } from "obsidian";
 import { SupabaseClient } from "@supabase/supabase-js";
-import { isBinary, isExcluded, isPlatformExcluded, isSystemFile } from "./settings";
+import { isBinary, isExcluded, isPlatformExcluded, isSystemFile, isSystemGeneratedNote } from "./settings";
 import { parseFrontmatter } from "./frontmatter";
 import { SyncStatus } from "./supabase";
 
@@ -12,8 +12,6 @@ const CONFIG_WATCH_MS = 5000;
 const REALTIME_RECONNECT_MS = 5000;
 
 function stripNullBytes(s: string): string {
-	// Postgres text type rejects null bytes; strip them rather than crash.
-	// Using split/join avoids the no-control-regex lint rule.
 	return s.includes("\0") ? s.split("\0").join("") : s;
 }
 
@@ -61,6 +59,7 @@ export interface SyncHost {
 	readonly vault: Vault;
 	readonly settings: {
 		vaultId: string;
+		systemVaultId: string;
 		syncOnStartup: boolean;
 		syncConfigFolder: boolean;
 		syncIntervalMinutes: number;
@@ -87,8 +86,6 @@ export class SyncEngine {
 	private ignorePaths = new Set<string>();
 	private realtimeReconnectTimer: number | null = null;
 
-	// Injected by main.ts after both managers are created.
-	// Returns true while the CRDT broadcast channel owns that file's editing session.
 	crdtIsActive: ((path: string) => boolean) | null = null;
 
 	constructor(host: SyncHost) {
@@ -124,6 +121,16 @@ export class SyncEngine {
 		if (row.platform === "all") return true;
 		const currentPlatform = Platform.isMobile ? "mobile" : "desktop";
 		return row.platform === currentPlatform;
+	}
+
+	/**
+	 * Determine conflict winner for a vault_files row.
+	 * System-generated notes (from the translation layer) are always
+	 * server-authoritative — the Postgres trigger is the source of truth.
+	 * User-created notes use mtime-based resolution (existing behavior).
+	 */
+	private isServerAuthoritative(row: VaultFileRow): boolean {
+		return isSystemGeneratedNote(row.frontmatter);
 	}
 
 	private async listAdapterFiles(folderPath: string): Promise<string[]> {
@@ -404,7 +411,6 @@ export class SyncEngine {
 			try {
 				await this.host.vault.createBinary(row.path, buffer);
 			} catch {
-				// Fallback for paths outside vault index
 				await this.host.vault.adapter.writeBinary(row.path, buffer);
 			}
 		}
@@ -425,7 +431,6 @@ export class SyncEngine {
 			try {
 				await this.host.vault.create(row.path, content);
 			} catch {
-				// Fallback for paths outside vault index
 				await this.host.vault.adapter.write(row.path, content);
 			}
 		}
@@ -477,6 +482,31 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Fetch remote rows for BOTH user vault and system vault.
+	 * System vault notes are pull-only (never pushed from Obsidian).
+	 */
+	private async fetchAllRemoteRows(): Promise<VaultFileRow[]> {
+		const { vaultId, systemVaultId } = this.host.settings;
+		const vaultIds = [vaultId];
+		if (systemVaultId && systemVaultId !== vaultId) {
+			vaultIds.push(systemVaultId);
+		}
+
+		const { data, error } = await this.client
+			.from(DB_TABLE)
+			.select("*")
+			.in("vault_id", vaultIds)
+			.eq("deleted", false);
+
+		if (error)
+			throw new Error(
+				`failed to fetch remote files - ${error.message}`,
+			);
+
+		return (data as VaultFileRow[]) ?? [];
+	}
+
 	async fetchOnly(): Promise<void> {
 		const { vaultId } = this.host.settings;
 
@@ -489,25 +519,22 @@ export class SyncEngine {
 		const errors: string[] = [];
 
 		try {
-			const { data, error } = await this.client
-				.from(DB_TABLE)
-				.select("*")
-				.eq("vault_id", vaultId)
-				.eq("deleted", false);
-
-			if (error)
-				throw new Error(
-					`failed to fetch remote files - ${error.message}`,
-				);
-
-			const remoteRows = (data as VaultFileRow[]) ?? [];
+			const remoteRows = await this.fetchAllRemoteRows();
 
 			for (const row of remoteRows) {
 				if (this.shouldSkip(row.path)) continue;
 				if (!this.shouldPull(row)) continue;
 				if (this.crdtIsActive?.(row.path)) continue;
+
 				const localMtime = await this.getLocalMtime(row.path);
-				if (row.mtime > localMtime) {
+
+				// System notes: always pull from server (server-authoritative)
+				// User notes: pull only if server is newer (mtime-based)
+				const shouldPull = this.isServerAuthoritative(row)
+					? true
+					: row.mtime > localMtime;
+
+				if (shouldPull || localMtime === 0) {
 					try {
 						await this.pullFile(row);
 					} catch {
@@ -534,7 +561,7 @@ export class SyncEngine {
 	}
 
 	async fullSync(): Promise<void> {
-		const { vaultId } = this.host.settings;
+		const { vaultId, systemVaultId } = this.host.settings;
 
 		if (!vaultId) {
 			new Notice("Supabase jump: vault ID is not set - cannot sync");
@@ -545,28 +572,22 @@ export class SyncEngine {
 		const errors: string[] = [];
 
 		try {
-			const { data, error } = await this.client
-				.from(DB_TABLE)
-				.select("*")
-				.eq("vault_id", vaultId)
-				.eq("deleted", false);
-
-			if (error)
-				throw new Error(
-					`failed to fetch remote files - ${error.message}`,
-				);
-
-			const remoteRows = (data as VaultFileRow[]) ?? [];
+			const remoteRows = await this.fetchAllRemoteRows();
 			const remoteMap = new Map<string, VaultFileRow>(
 				remoteRows.map((r) => [r.path, r]),
 			);
 
+			// Push local files (only to user vault, never to system vault)
 			const localFiles = this.host.vault
 				.getFiles()
 				.filter((f) => !this.shouldSkip(f.path));
 
 			for (const file of localFiles) {
 				const remote = remoteMap.get(file.path);
+
+				// Don't push if this path belongs to a system-generated note
+				if (remote && this.isServerAuthoritative(remote)) continue;
+
 				if (!remote || file.stat.mtime > remote.mtime) {
 					try {
 						await this.pushFile(file);
@@ -602,12 +623,21 @@ export class SyncEngine {
 				}
 			}
 
+			// Pull remote files (from both user vault and system vault)
 			for (const row of remoteRows) {
 				if (this.shouldSkip(row.path)) continue;
 				if (!this.shouldPull(row)) continue;
 				if (this.crdtIsActive?.(row.path)) continue;
+
 				const localMtime = await this.getLocalMtime(row.path);
-				if (row.mtime > localMtime) {
+
+				// System notes: always pull (server-authoritative)
+				// User notes: pull only if server is newer
+				const shouldPull = this.isServerAuthoritative(row)
+					? true
+					: row.mtime > localMtime;
+
+				if (shouldPull || localMtime === 0) {
 					try {
 						await this.pullFile(row);
 					} catch {
@@ -635,18 +665,28 @@ export class SyncEngine {
 	}
 
 	startRealtimeListener(): void {
-		const { vaultId } = this.host.settings;
+		const { vaultId, systemVaultId } = this.host.settings;
 		if (!vaultId) return;
 
+		// Subscribe to user vault changes
+		this.subscribeToVault(vaultId);
+
+		// Also subscribe to system vault changes (if configured and different)
+		if (systemVaultId && systemVaultId !== vaultId) {
+			this.subscribeToVault(systemVaultId);
+		}
+	}
+
+	private subscribeToVault(targetVaultId: string): void {
 		this.client
-			.channel(`vault-${vaultId}`)
+			.channel(`vault-${targetVaultId}`)
 			.on<VaultFileRow>(
 				"postgres_changes",
 				{
 					event: "*",
 					schema: "public",
 					table: DB_TABLE,
-					filter: `vault_id=eq.${vaultId}`,
+					filter: `vault_id=eq.${targetVaultId}`,
 				},
 				(payload) => {
 					this.handleRealtimeEvent(payload).catch((err) => {
@@ -663,7 +703,7 @@ export class SyncEngine {
 			.subscribe((status: string) => {
 				if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
 					console.error(
-						`Supabase jump: Realtime channel ${status.toLowerCase()} - reconnecting in ${REALTIME_RECONNECT_MS / 1000}s`,
+						`Supabase jump: Realtime channel ${status.toLowerCase()} for vault ${targetVaultId} - reconnecting in ${REALTIME_RECONNECT_MS / 1000}s`,
 					);
 					this.host.setStatus("error");
 					new Notice(
@@ -704,10 +744,17 @@ export class SyncEngine {
 			return;
 		}
 
-		// While a CRDT broadcast session is active, Yjs handles merging;
-		// a raw DB pull here would overwrite the correctly merged editor state.
 		if (this.crdtIsActive?.(row.path)) return;
 
+		// System notes: always pull on any change (server-authoritative)
+		if (this.isServerAuthoritative(row)) {
+			if (this.shouldPull(row)) {
+				await this.pullFile(row);
+			}
+			return;
+		}
+
+		// User notes: mtime-based
 		const localMtime = await this.getLocalMtime(row.path);
 		if (row.mtime > localMtime && this.shouldPull(row)) {
 			await this.pullFile(row);

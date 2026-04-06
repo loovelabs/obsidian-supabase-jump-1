@@ -1,10 +1,10 @@
 {
 	"id": "supabase-jump",
-	"name": "SupaBase Jump",
-	"version": "1.1.5",
+	"name": "SupaBase Jump (LOOVE)",
+	"version": "1.2.0-loove",
 	"minAppVersion": "0.25.0",
-	"description": "Sync your vault with Supabase in real time.",
-	"author": "Brians Tjipto",
-	"authorUrl": "https://github.com/brianstm",
+	"description": "Sync your vault with Supabase in real time. LOOVE fork with system vault support.",
+	"author": "Brians Tjipto / LOOVE Labs",
+	"authorUrl": "https://github.com/loovelabs",
 	"isDesktopOnly": false
 }
