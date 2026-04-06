@@ -1,7 +1,7 @@
 {
-	"name": "supabase-jump",
-	"version": "1.1.5",
-	"description": "Obsidian plugin to sync your vault with Supabase",
+	"name": "supabase-jump-loove",
+	"version": "1.2.0-loove",
+	"description": "Obsidian plugin to sync your vault with Supabase — LOOVE fork with system vault & translation layer support",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
@@ -16,16 +16,17 @@
 		"supabase",
 		"sync",
 		"realtime",
-		"backup"
+		"backup",
+		"loove"
 	],
-	"author": "Brians Tjipto",
+	"author": "Brians Tjipto / LOOVE Labs",
 	"license": "0-BSD",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/brianstm/obsidian-supabase-jump.git"
+		"url": "https://github.com/loovelabs/obsidian-supabase-jump-1.git"
 	},
 	"bugs": {
-		"url": "https://github.com/brianstm/obsidian-supabase-jump/issues"
+		"url": "https://github.com/loovelabs/obsidian-supabase-jump-1/issues"
 	},
 	"devDependencies": {
 		"@eslint/js": "9.30.1",
